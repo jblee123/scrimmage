@@ -284,7 +284,9 @@ endif()
 option(BUILD_ROS_PLUGINS "BUILD_ROS_PLUGINS" OFF)
 if (BUILD_ROS_PLUGINS)
   find_package(catkin REQUIRED COMPONENTS roscpp sensor_msgs std_msgs
-    geometry_msgs nav_msgs tf image_transport cv_bridge tf2_ros tf2 tf2_geometry_msgs)
+    geometry_msgs nav_msgs image_transport cv_bridge)
+    # locust-integration removing tf and tf2 dependencies
+    # geometry_msgs nav_msgs tf image_transport cv_bridge tf2_ros tf2 tf2_geometry_msgs)
   if (catkin_FOUND)
     include_directories(${catkin_INCLUDE_DIRS})
   endif()

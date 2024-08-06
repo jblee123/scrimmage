@@ -1,3 +1,6 @@
+# We don't want to build this for locust-integration.
+return()
+
 if (NOT catkin_FOUND)
   return()
 endif()

@@ -1,3 +1,6 @@
+# We don't want to build this for locust-integration.
+return()
+
 if (NOT (catkin_FOUND AND OpenCV_FOUND AND AIRSIM_FOUND) )
   return()
 endif()
