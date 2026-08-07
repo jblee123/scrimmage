@@ -658,10 +658,73 @@ void SimControl::run_remove_inactive() {
     }
 }
 
+void readjust_origin_to_entity(std::list<EntityPtr> ents, int id) {
+    EntityPtr the_ent;
+    for (auto& ent : ents) {
+        if (ent->id().id() == id) {
+            the_ent = ent;
+            break;
+        }
+    }
+
+    if (!the_ent) {
+        printf("ENTITY WITH ID %d NOT FOUND!!!\n", id);
+        return;
+    }
+
+    auto old_proj = *(the_ent->projection());
+    auto& global_proj = *(the_ent->projection());
+
+    // get main entity's current location in lat/lon, which will become the new
+    // global origin. Use 0 as the z coord here so the altitude affects the
+    // horizontal position less.
+    Eigen::Vector3d& main_pos = the_ent->state_truth()->pos();
+    double alt_unused;
+    double new_lat, new_lon;
+    old_proj.Reverse(
+        main_pos.x(), main_pos.y(), 0,
+        new_lat, new_lon, alt_unused);
+
+    {
+        using ClockType = std::chrono::high_resolution_clock;
+
+        static double __last_print_sec = 0;
+
+        auto now = ClockType::now().time_since_epoch();
+        double __timestamp_sec =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() * 1e-9;
+        if (__last_print_sec + 10 <= __timestamp_sec) {
+            printf("Updating origin to (%f, %f)\n", new_lat, new_lon);
+            __last_print_sec = __timestamp_sec;
+        }
+    }
+
+    // update the global origin
+    global_proj.Reset(new_lat, new_lon, old_proj.HeightOrigin());
+
+    // for each entity
+    for (auto& ent : ents) {
+        // See where they're at in lat/lon given the existing origin. Use 0 as
+        // the z coord here so the altitude affects the horizontal position less.
+        Eigen::Vector3d& ent_pos = ent->state_truth()->pos();
+        double ent_lat, ent_lon;
+        old_proj.Reverse(
+            ent_pos.x(), ent_pos.y(), 0,
+            ent_lat, ent_lon, alt_unused);
+
+        // Set the new location to where they'd be in xyz given the new origin.
+        global_proj.Forward(
+            ent_lat, ent_lon, 0,
+            ent_pos.x(), ent_pos.y(), alt_unused);
+    }
+}
+
 bool SimControl::run_single_step(const int& loop_number) {
     double t = this->t();
     reseed_task_.update(t);
     start_loop_timer();
+
+    readjust_origin_to_entity(ents_, 1);
 
     if (!generate_entities(t)) {
         LOG_ERROR("Failed to generate entity");
