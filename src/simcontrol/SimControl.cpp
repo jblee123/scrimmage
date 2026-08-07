@@ -107,6 +107,157 @@ namespace ba = boost::adaptors;
 
 using NormDistribution = std::normal_distribution<double>;
 
+namespace long_range_hack {
+
+struct LatLonAlt {
+    double lat_deg;
+    double lon_deg;
+    double alt_m;
+};
+
+// Shift the global cartesian projection such that the origin will match the
+// lat/lon coord of the entity with the specified ID and an altitude of 0.
+// All entity state positions will be updated to reflect the origin change.
+//
+// Vanilla scrimmage will not SIL across large distances correctly because it
+// assumes the working area is a localized flat earth, which is fine for smaller
+// (e.g. 10 km x 10 km) areas, but it breaks for larger areas. E.g., as you get
+// farther away from the origin, the difference between "up" as defined by "+z"
+// and "up" as defined by "away from earth's center" grows; the whole frame of
+// reference with respect to the earth rotates.
+//
+// One time this problem reared its head involved external plugins that
+// implemented behaviors that were flown on real-life aircraft. The plugins' XML
+// files were basically treated as part of the behaviors' source, and therefore
+// their projection origins were effectively hard-coded. The solution was to
+// have the behavior each create an orientation transformation in order to
+// re-orient the aircraft inside the plugin. However, that solution must be
+// handed on an plugin-by-plugin basis.
+//
+// The hacky solution chosen here is to continuously re-adjust the origin
+// depending on what entity is being processed. When an entity is being
+// processed, the global projection will be reset to center on that entity's
+// location, and all entity states will be updated to reflect the origin change.
+// Because scrimmage uses shared pointers to everything, updating an entity's
+// state will autmatically be reflected by any plugins that are children of that
+// entity, as well as contacts that point back to that entity.
+//
+// Scrimmage processes entities in several stages, so there are several places
+// where this reprojection must happen:
+// 1. running autonomy plugins,
+// 2. running controllers,
+// 3. running motion models,
+// 4. running sensors,
+// Each simulation step, scrimmage runs through these four simulation stages,
+// and at each stage scrimmage will iterate over all entities for processing,
+// and for each processing of an entity, reprojection must occur.
+//
+// After stage 4, one final reprojection is made, which is to reset the origin
+// the location of the single aircraft (currently assumed to be ID 1) in the
+// simulation. I currently do no know why this final step is required since, at
+// that point, I would think any updates to the aircaft are finished, but that
+// reasoning is evidently incorrect, because if the step is missing, the
+// simulated aircraft looks majorly broken.
+//
+// Additionally, the STARTING ORIGIN from the scrimmage mission file needs to be
+// in the area of the aircraft. Again, I don't know why since reprojections
+// should happen before anything is touched, but if it's far away from the
+// aircaft, the simulation breaks.
+//
+// Be careful with "entity_interaction" plugins that may care about multiple
+// entity states at once. These plugins have their own logic for interacting
+// with the list of entities, so this solution does not try to work with those.
+// Instead, the original use case for this solution was one where it was known
+// that none of the interaction plugins would be an issue.
+//
+// Actually, while writing the previous paragraph and delving into the
+// GroundCollision interaction, it looks like: 1) intersctions are run once
+// before the main sim loop, and 2) that interaction can impose an upward force
+// on the motion model, which will actually be off to the side if the origin is
+// not around the aircraft, so maybe that's something that's going on.
+//
+// There are several shortcomings here.
+//
+// 1) We assume 1 aircraft with ID 1. This scheme may still work with multiple
+// aircraft as long as they stay close together, but I have not tried it.
+//
+// 2) This will break if multi-threading is turned on. Multi-threading can work
+// if shared data remains constant while all the threads run, but that is not
+// the case if everything is globally reprojected for each entity.
+//
+// 3) Logic breaks if "local flat earth" assumptions are necessary when looking
+// at other entities. For instance, if one entity has logic based on another
+// entity's location, certain assumptions may not hold if the two entities are
+// very far part. For instance, what would be the same MSL altitudes in lat/lon
+// are different in local cartesian. This concern is mostly alleviated by the
+// assumption that if two entities are far enough apart to cause issues from the
+// earth's curvature, then they're too far apart to care about each other. E.g.
+// if a simulated camera is producing a vector to a target, then if the target
+// is far enough away that the earth's curve causes an issue, it is also out of
+// range of the camera.
+void readjust_origin_to_entity(std::list<sc::EntityPtr>& ents, int id) {
+    // Find the target entity that will drive the new origin.
+    sc::EntityPtr origin_ent;
+    for (auto& ent : ents) {
+        if (ent->id().id() == id) {
+            origin_ent = ent;
+            break;
+        }
+    }
+
+    if (!origin_ent) {
+        printf("ENTITY %d NOT FOUND!!!\n", id);
+        return;
+    }
+
+    // Copy the existing projection before resetting the origin so we'll be able
+    // to translate between the two later.
+    auto old_proj = *(origin_ent->projection());
+
+    // Get the current geo coords of the origin entity. Do not simply keep the
+    // existing altitude since we are dealing with distances where we cannot
+    // pretend local-flat-earth.
+    Eigen::Vector3d& origin_ent_pos = origin_ent->state_truth()->pos();
+    LatLonAlt origin_coord;
+    old_proj.Reverse(
+        origin_ent_pos.x(), origin_ent_pos.y(), origin_ent_pos.z(),
+        origin_coord.lat_deg, origin_coord.lon_deg, origin_coord.alt_m);
+
+    // Set the new origin, but be user to use 0 as the altitude. If a non-zero
+    // value is used, then when the sim starts, the vehicle ends up sinking down
+    // to 0 anyway, and weirdness started to happen, but I'm not 100% sure why.
+    // I could see that if the position's z coordinate was assumed to be the
+    // MSL altitude, then having an offset origin would mess that up, so maybe
+    // that's the case somewhere, but if the project is used, it *should* be
+    // fine. One other note is that local cartesian orign altitudes are measured
+    // from the surface of the *ellipsoid* (HAE), not the *geoid* (MSL), so
+    // that's a thing.
+    auto& new_proj = *(origin_ent->projection());
+    new_proj.Reset(origin_coord.lat_deg, origin_coord.lon_deg, 0);
+
+    // Update the state of all entities to reflect the updated origin.
+    for (auto& ent : ents) {
+
+        Eigen::Vector3d& ent_pos = ent->state_truth()->pos();
+
+        // Extract the location from the OLD projection.
+        LatLonAlt geocoord;
+        old_proj.Reverse(
+            ent_pos.x(), ent_pos.y(), ent_pos.z(),
+            geocoord.lat_deg, geocoord.lon_deg, geocoord.alt_m);
+
+
+        // Set the new location to where they'd be in xyz given the new origin.
+        new_proj.Forward(
+            geocoord.lat_deg, geocoord.lon_deg, geocoord.alt_m,
+            ent_pos.x(), ent_pos.y(), ent_pos.z());
+    }
+}
+
+} // namespace
+
+namespace lrh = long_range_hack;
+
 namespace scrimmage {
 
 SimControl::SimControl()
@@ -740,6 +891,14 @@ bool SimControl::run_single_step(const int& loop_number) {
         }
         return false;
     }
+
+    // The simulated aircraft is vehicle 1. Now that all the plugins have been
+    // processed, do one final re-adjustment to vehicle 1. I'm not exactly sure
+    // why this matters, but when it doesn't happen, the simulation gets all
+    // messed up. Therefore, I can only conclude that some part of the system is
+    // still doing something with the vehicle's state, and that state needs to
+    // be able to adhere to the "localized flat earth" assumption.
+    lrh::readjust_origin_to_entity(ents_, 1);
 
     if (!run_interaction_detection()) {
         auto msg = std::make_shared<Message<sm::EntityInteractionExit>>();
@@ -1679,6 +1838,7 @@ bool SimControl::run_sensors() {
             br::for_each(ent->sensors() | ba::map_values, run_callbacks);
             for (auto& sensor : ent->sensors() | ba::map_values) {
                 if (sensor->step_loop_timer(dt_)) {
+                    lrh::readjust_origin_to_entity(ents_, ent->id().id());
                     if (!sensor->step()) {
                         if (sensor->print_err_on_exit) {
                             LOG_ERROR("failed to update entity " << sensor->parent()->id().id()
@@ -1739,6 +1899,7 @@ bool SimControl::run_entities() {
     auto exec_step = [&](auto p, auto step_func) {
         run_callbacks(p);
         try {
+            lrh::readjust_origin_to_entity(ents_, p->parent()->id().id());
             if (!step_func(p)) {
                 if (p->print_err_on_exit) {
                     LOG_ERROR("failed to update entity " << p->parent()->id().id()
