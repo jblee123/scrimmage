@@ -63,6 +63,7 @@
 #endif
 
 #include <chrono>  // NOLINT
+#include <format>
 #include <future>  // NOLINT
 #include <iostream>
 #include <memory>
@@ -107,7 +108,35 @@ namespace ba = boost::adaptors;
 
 using NormDistribution = std::normal_distribution<double>;
 
+#define SCR_LOG_THROTTLE(period_sec, fmt, ...)                                           \
+    {                                                                                    \
+        using ClockType = std::chrono::high_resolution_clock;                            \
+        static double __last_print_sec = 0;                                              \
+        auto now = ClockType::now().time_since_epoch();                                  \
+        double __timestamp_sec = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() * 1e-9; \
+        if (__last_print_sec + period_sec <= __timestamp_sec) {                          \
+            std::string __err_msg = std::format(fmt, ##__VA_ARGS__);                     \
+            printf("%s", __err_msg.c_str());                                             \
+            __last_print_sec = __timestamp_sec;                                          \
+        }                                                                                \
+    }
+
 namespace {
+
+bool throttled_print(double& last_print_time_sec, double delay_sec) {
+    using ClockType = std::chrono::high_resolution_clock;
+
+    auto now = ClockType::now().time_since_epoch();
+    double timestamp_sec =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() * 1e-9;
+
+    bool do_print = false;
+    if (last_print_time_sec + delay_sec <= timestamp_sec) {
+        do_print = true;
+        last_print_time_sec = timestamp_sec;
+    }
+    return do_print;
+}
 
 struct LatLonAlt {
     double lat_deg;
@@ -117,7 +146,7 @@ struct LatLonAlt {
 
 std::map<int, LatLonAlt> entity_geocoords;
 
-void collect_geocoords(const std::list<sc::EntityPtr>& ents) {
+std::map<int, LatLonAlt> collect_geocoords(const std::list<sc::EntityPtr>& ents) {
     bool print = false;
     {
         using ClockType = std::chrono::high_resolution_clock;
@@ -137,6 +166,8 @@ void collect_geocoords(const std::list<sc::EntityPtr>& ents) {
         printf("======\n");
     }
 
+    std::map<int, LatLonAlt> geocoords;
+
     for (auto& ent : ents) {
         const Eigen::Vector3d& pos = ent->state_truth()->pos();
         LatLonAlt geocoord;
@@ -144,7 +175,7 @@ void collect_geocoords(const std::list<sc::EntityPtr>& ents) {
             pos.x(), pos.y(), pos.z(),
             geocoord.lat_deg, geocoord.lon_deg, geocoord.alt_m);
 
-        entity_geocoords[ent->id().id()] = geocoord;
+        geocoords[ent->id().id()] = geocoord;
 
         if (print) {
             printf("enity %d pos: %f, %f, %f\n",
@@ -158,8 +189,30 @@ void collect_geocoords(const std::list<sc::EntityPtr>& ents) {
     if (print) {
         printf("======\n");
     }
+
+    return geocoords;
 }
 
+void give_individual_projections(std::list<sc::EntityPtr>& ents) {
+    std::map<int, LatLonAlt> geocoords = collect_geocoords(ents);
+
+    for (auto& ent : ents) {
+        int id = ent->id().id();
+        auto geocoord = geocoords[id];
+        auto ent_proj = std::make_shared<GeographicLib::LocalCartesian>(
+            geocoord.lat_deg, geocoord.lon_deg, 0);
+        ent->set_projection(ent_proj);
+        auto& pos = ent->state_truth()->pos();
+        pos.x() = 0;
+        pos.y() = 0;
+        pos.z() = geocoord.alt_m;
+
+        printf("giving entity %d its own proj at %f, %f\n",
+            id, geocoord.lat_deg, geocoord.lon_deg);
+    }
+}
+
+/*
 void readjust_origin_to_entity(std::list<sc::EntityPtr>& ents, int id) {
     sc::EntityPtr the_ent;
     for (auto& ent : ents) {
@@ -203,7 +256,7 @@ void readjust_origin_to_entity(std::list<sc::EntityPtr>& ents, int id) {
             ent_pos.x(), ent_pos.y(), ent_pos.z());
     }
 }
-
+*/
 } // namespace
 
 namespace scrimmage {
@@ -674,6 +727,16 @@ bool SimControl::run_interaction_detection() {
         shapes_[0].insert(shapes_[0].end(), ent_inter->shapes().begin(), ent_inter->shapes().end());
         ent_inter->shapes().clear();
     };
+    for (auto& ent : ents_) {
+        if (!ent->is_alive() && ent->posthumous(this->t())) {
+            int id = ent->id().id();
+
+            printf("chkpt 1 for entity %d\n", id);
+            printf("- is_alive: %s\n", ent->is_alive() ? "true" : "false");
+            printf("- posthumous: %s\n", ent->posthumous(this->t()) ? "true" : "false");
+        }
+    }
+
 
     br::for_each(ent_inters_, run_callbacks);
     bool success = std::all_of(ent_inters_.begin(), ent_inters_.end(), run_interaction);
@@ -683,6 +746,10 @@ bool SimControl::run_interaction_detection() {
     for (auto& ent : ents_) {
         if (!ent->is_alive() && ent->posthumous(this->t())) {
             int id = ent->id().id();
+
+            printf("removing entity %d\n", id);
+            printf("- is_alive: %s\n", ent->is_alive() ? "true" : "false");
+            printf("- posthumous: %s\n", ent->posthumous(this->t()) ? "true" : "false");
 
             auto msg = std::make_shared<Message<sm::EntityRemoved>>();
             msg->data.set_entity_id(id);
@@ -763,7 +830,24 @@ bool SimControl::run_single_step(const int& loop_number) {
     start_loop_timer();
 
     if (loop_number == 0) {
-        collect_geocoords(ents_);
+        // collect_geocoords(ents_);
+
+        printf("====\n");
+        for (EntityPtr& ent : ents_) {
+            printf("pre ent id: %d\n", ent->id().id());
+        }
+
+        give_individual_projections(ents_);
+
+        entity_geocoords = collect_geocoords(ents_);
+
+        for (auto& ent : ents_) {
+            int id = ent->id().id();
+            if (id == 1) {
+                LatLonAlt coord = entity_geocoords[id];
+                proj_->Reset(coord.lat_deg, coord.lon_deg, 0);
+            }
+        }
     }
 
     if (!generate_entities(t)) {
@@ -867,7 +951,19 @@ bool SimControl::run_single_step(const int& loop_number) {
         return false;
     }
 
+    if ((loop_number == 0)) {
+        printf("====\n");
+        for (EntityPtr& ent : ents_) {
+            printf("post a ent id: %d\n", ent->id().id());
+        }
+    }
     run_remove_inactive();
+    if ((loop_number == 0)) {
+        printf("====\n");
+        for (EntityPtr& ent : ents_) {
+            printf("post b ent id: %d\n", ent->id().id());
+        }
+    }
     run_send_shapes();
     run_send_contact_visuals();  // send updated visuals
 
@@ -1783,7 +1879,7 @@ bool SimControl::run_sensors() {
             br::for_each(ent->sensors() | ba::map_values, run_callbacks);
             for (auto& sensor : ent->sensors() | ba::map_values) {
                 if (sensor->step_loop_timer(dt_)) {
-                    readjust_origin_to_entity(ents_, ent->id().id());
+                    // readjust_origin_to_entity(ents_, ent->id().id());
                     if (!sensor->step()) {
                         if (sensor->print_err_on_exit) {
                             LOG_ERROR("failed to update entity " << sensor->parent()->id().id()
@@ -1841,10 +1937,21 @@ bool SimControl::run_entities() {
     contacts_mutex_.lock();
     bool success = true;
 
+    static double last_print_sec = 0;
+    bool do_print = throttled_print(last_print_sec, 1);
+
+    if (do_print) {
+        LOG_INFO("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        printf("====\n");
+        for (EntityPtr& ent : ents_) {
+            printf("ent id: %d\n", ent->id().id());
+        }
+    }
+
     auto exec_step = [&](auto p, auto step_func) {
         run_callbacks(p);
         try {
-            readjust_origin_to_entity(ents_, p->parent()->id().id());
+            // readjust_origin_to_entity(ents_, p->parent()->id().id());
             if (!step_func(p)) {
                 if (p->print_err_on_exit) {
                     LOG_ERROR("failed to update entity " << p->parent()->id().id()
@@ -1960,6 +2067,9 @@ bool SimControl::run_entities() {
                 success &= add_tasks(type, temp_t, motion_dt);
             } else {
                 for (EntityPtr& ent : ents_) {
+                    if (do_print) {
+                        printf("ent %d\n", ent->id().id());
+                    }
                     if (!ent->using_gpu_motion_model()) {
                         auto step = [&](auto p) {
                             auto pos1 = ent->state_truth()->pos();
@@ -1969,17 +2079,23 @@ bool SimControl::run_entities() {
 
 
 
-                                LatLonAlt geocoord;
-                                ent->projection()->Reverse(
-                                    pos2.x(), pos2.y(), pos2.z(),
-                                    geocoord.lat_deg, geocoord.lon_deg, geocoord.alt_m);
+                                // LatLonAlt geocoord;
+                                // ent->projection()->Reverse(
+                                //     pos2.x(), pos2.y(), pos2.z(),
+                                //     geocoord.lat_deg, geocoord.lon_deg, geocoord.alt_m);
 
-                                entity_geocoords[ent->id().id()] = geocoord;
+                                // entity_geocoords[ent->id().id()] = geocoord;
 
 
-
-                                // printf("ent %d: different pos from running motion %s.\n",
-                                //     ent->id().id(), p->type().c_str());
+                                if (do_print) {
+                                    printf("ent %d: different pos from running motion %s.\n",
+                                        ent->id().id(), p->type().c_str());
+                                }
+                            } else {
+                                if (do_print) {
+                                    printf("ent %d: stayed still after running motion %s.\n",
+                                        ent->id().id(), p->type().c_str());
+                                }
                             }
                             return ok;
                         };
