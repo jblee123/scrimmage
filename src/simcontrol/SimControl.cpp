@@ -118,6 +118,25 @@ struct LatLonAlt {
 std::map<int, LatLonAlt> entity_geocoords;
 
 void collect_geocoords(const std::list<sc::EntityPtr>& ents) {
+    bool print = false;
+    {
+        using ClockType = std::chrono::high_resolution_clock;
+
+        static double __last_print_sec = 0;
+
+        auto now = ClockType::now().time_since_epoch();
+        double __timestamp_sec =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() * 1e-9;
+        if (__last_print_sec + 1 <= __timestamp_sec) {
+            print = true;
+            __last_print_sec = __timestamp_sec;
+        }
+    }
+
+    if (print) {
+        printf("======\n");
+    }
+
     for (auto& ent : ents) {
         const Eigen::Vector3d& pos = ent->state_truth()->pos();
         LatLonAlt geocoord;
@@ -127,11 +146,17 @@ void collect_geocoords(const std::list<sc::EntityPtr>& ents) {
 
         entity_geocoords[ent->id().id()] = geocoord;
 
-        // printf("enity %d pos: %f, %f, %f\n",
-        //     ent->id().id(),
-        //     geocoord.lat_deg,
-        //     geocoord.lon_deg,
-        //     geocoord.alt_m);
+        if (print) {
+            printf("enity %d pos: %f, %f, %f\n",
+                ent->id().id(),
+                geocoord.lat_deg,
+                geocoord.lon_deg,
+                geocoord.alt_m);
+        }
+    }
+
+    if (print) {
+        printf("======\n");
     }
 }
 
@@ -811,7 +836,7 @@ bool SimControl::run_single_step(const int& loop_number) {
         }
         return false;
     }
-    collect_geocoords(ents_);
+    // collect_geocoords(ents_);
 
     if (!run_sensors()) {
         if (!limited_verbosity_) {
@@ -1845,7 +1870,17 @@ bool SimControl::run_entities() {
         for (EntityPtr& ent : ents_) {
             for (auto a : ent->autonomies()) {
                 success &= exec_step(a, [&](auto a) {
-                    return a->step_loop_timer(dt_) ? a->step_autonomy(t_, dt_) : true;
+                    if (a->step_loop_timer(dt_)) {
+                        auto pos1 = ent->state_truth()->pos();
+                        bool ok = a->step_autonomy(t_, dt_);
+                        auto pos2 = ent->state_truth()->pos();
+                        if (pos1 != pos2) {
+                            printf("ent %d: different pos from running autonomy %s.\n",
+                                ent->id().id(), a->type().c_str());
+                        }
+                        return ok;
+                    }
+                    return true;
                 });
             }
         }
@@ -1884,11 +1919,27 @@ bool SimControl::run_entities() {
         for (EntityPtr& ent : ents_) {
             for (auto c : ent->controllers()) {
                 double loop_t = ctrl_t;  // Capture current time for this iteration
-                success &= exec_step(c, [loop_t, motion_dt](auto c) {
+                success &= exec_step(c, [ent, loop_t, motion_dt](auto c) {
+
+
                     if (c->step_loop_timer(motion_dt)) {
-                        return c->step(loop_t, motion_dt);
+                        auto pos1 = ent->state_truth()->pos();
+                        bool ok = c->step(loop_t, motion_dt);
+                        auto pos2 = ent->state_truth()->pos();
+                        if (pos1 != pos2) {
+                            printf("ent %d: different pos from running controller ???.\n",
+                                ent->id().id());
+                        }
+                        return ok;
                     }
                     return true;
+
+
+
+                    // if (c->step_loop_timer(motion_dt)) {
+                    //     return c->step(loop_t, motion_dt);
+                    // }
+                    // return true;
                 });
             }
         }
@@ -1910,7 +1961,28 @@ bool SimControl::run_entities() {
             } else {
                 for (EntityPtr& ent : ents_) {
                     if (!ent->using_gpu_motion_model()) {
-                        auto step = [&](auto p) { return p->step(temp_t, motion_dt); };
+                        auto step = [&](auto p) {
+                            auto pos1 = ent->state_truth()->pos();
+                            bool ok = p->step(temp_t, motion_dt);
+                            auto pos2 = ent->state_truth()->pos();
+                            if (pos1 != pos2) {
+
+
+
+                                LatLonAlt geocoord;
+                                ent->projection()->Reverse(
+                                    pos2.x(), pos2.y(), pos2.z(),
+                                    geocoord.lat_deg, geocoord.lon_deg, geocoord.alt_m);
+
+                                entity_geocoords[ent->id().id()] = geocoord;
+
+
+
+                                // printf("ent %d: different pos from running motion %s.\n",
+                                //     ent->id().id(), p->type().c_str());
+                            }
+                            return ok;
+                        };
                         success &= exec_step(getter(ent), step);
                     }
                 }
