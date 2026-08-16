@@ -107,6 +107,80 @@ namespace ba = boost::adaptors;
 
 using NormDistribution = std::normal_distribution<double>;
 
+namespace {
+
+struct LatLonAlt {
+    double lat_deg;
+    double lon_deg;
+    double alt_m;
+};
+
+std::map<int, LatLonAlt> entity_geocoords;
+
+void collect_geocoords(const std::list<sc::EntityPtr>& ents) {
+    for (auto& ent : ents) {
+        const Eigen::Vector3d& pos = ent->state_truth()->pos();
+        LatLonAlt geocoord;
+        ent->projection()->Reverse(
+            pos.x(), pos.y(), pos.z(),
+            geocoord.lat_deg, geocoord.lon_deg, geocoord.alt_m);
+
+        entity_geocoords[ent->id().id()] = geocoord;
+
+        // printf("enity %d pos: %f, %f, %f\n",
+        //     ent->id().id(),
+        //     geocoord.lat_deg,
+        //     geocoord.lon_deg,
+        //     geocoord.alt_m);
+    }
+}
+
+void readjust_origin_to_entity(std::list<sc::EntityPtr>& ents, int id) {
+    sc::EntityPtr the_ent;
+    for (auto& ent : ents) {
+        if (ent->id().id() == id) {
+            the_ent = ent;
+            break;
+        }
+    }
+
+    if (!the_ent) {
+        printf("ENTITY %d NOT FOUND!!!\n", id);
+        return;
+    }
+
+    auto main_geocoord_iter = entity_geocoords.find(id);
+    if (main_geocoord_iter == entity_geocoords.end()) {
+        printf("GEOCOORD OF MAIN ENTITY %d NOT LISTED IN GEOCOORD LIST!!!\n", id);
+        return;
+    }
+
+    LatLonAlt main_geocoord = main_geocoord_iter->second;
+
+    auto& global_proj = *(the_ent->projection());
+    global_proj.Reset(main_geocoord.lat_deg, main_geocoord.lon_deg, 0);
+
+    // Update the state of all entities
+    for (auto& ent : ents) {
+
+        auto geocoord_iter = entity_geocoords.find(ent->id().id());
+        if (geocoord_iter == entity_geocoords.end()) {
+            printf("GEOCOORD OF ENTITY %d NOT LISTED IN GEOCOORD LIST!!!\n", id);
+            continue;
+        }
+
+        LatLonAlt geocoord = geocoord_iter->second;
+        Eigen::Vector3d& ent_pos = ent->state_truth()->pos();
+
+        // Set the new location to where they'd be in xyz given the new origin.
+        global_proj.Forward(
+            geocoord.lat_deg, geocoord.lon_deg, geocoord.alt_m,
+            ent_pos.x(), ent_pos.y(), ent_pos.z());
+    }
+}
+
+} // namespace
+
 namespace scrimmage {
 
 SimControl::SimControl()
@@ -658,73 +732,14 @@ void SimControl::run_remove_inactive() {
     }
 }
 
-void readjust_origin_to_entity(std::list<EntityPtr> ents, int id) {
-    EntityPtr the_ent;
-    for (auto& ent : ents) {
-        if (ent->id().id() == id) {
-            the_ent = ent;
-            break;
-        }
-    }
-
-    if (!the_ent) {
-        printf("ENTITY WITH ID %d NOT FOUND!!!\n", id);
-        return;
-    }
-
-    auto old_proj = *(the_ent->projection());
-    auto& global_proj = *(the_ent->projection());
-
-    // get main entity's current location in lat/lon, which will become the new
-    // global origin. Use 0 as the z coord here so the altitude affects the
-    // horizontal position less.
-    Eigen::Vector3d& main_pos = the_ent->state_truth()->pos();
-    double alt_unused;
-    double new_lat, new_lon;
-    old_proj.Reverse(
-        main_pos.x(), main_pos.y(), 0,
-        new_lat, new_lon, alt_unused);
-
-    {
-        using ClockType = std::chrono::high_resolution_clock;
-
-        static double __last_print_sec = 0;
-
-        auto now = ClockType::now().time_since_epoch();
-        double __timestamp_sec =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() * 1e-9;
-        if (__last_print_sec + 10 <= __timestamp_sec) {
-            printf("Updating origin to (%f, %f)\n", new_lat, new_lon);
-            __last_print_sec = __timestamp_sec;
-        }
-    }
-
-    // update the global origin
-    global_proj.Reset(new_lat, new_lon, old_proj.HeightOrigin());
-
-    // for each entity
-    for (auto& ent : ents) {
-        // See where they're at in lat/lon given the existing origin. Use 0 as
-        // the z coord here so the altitude affects the horizontal position less.
-        Eigen::Vector3d& ent_pos = ent->state_truth()->pos();
-        double ent_lat, ent_lon;
-        old_proj.Reverse(
-            ent_pos.x(), ent_pos.y(), 0,
-            ent_lat, ent_lon, alt_unused);
-
-        // Set the new location to where they'd be in xyz given the new origin.
-        global_proj.Forward(
-            ent_lat, ent_lon, 0,
-            ent_pos.x(), ent_pos.y(), alt_unused);
-    }
-}
-
 bool SimControl::run_single_step(const int& loop_number) {
     double t = this->t();
     reseed_task_.update(t);
     start_loop_timer();
 
-    readjust_origin_to_entity(ents_, 1);
+    if (loop_number == 0) {
+        collect_geocoords(ents_);
+    }
 
     if (!generate_entities(t)) {
         LOG_ERROR("Failed to generate entity");
@@ -796,6 +811,7 @@ bool SimControl::run_single_step(const int& loop_number) {
         }
         return false;
     }
+    collect_geocoords(ents_);
 
     if (!run_sensors()) {
         if (!limited_verbosity_) {
@@ -1742,6 +1758,7 @@ bool SimControl::run_sensors() {
             br::for_each(ent->sensors() | ba::map_values, run_callbacks);
             for (auto& sensor : ent->sensors() | ba::map_values) {
                 if (sensor->step_loop_timer(dt_)) {
+                    readjust_origin_to_entity(ents_, ent->id().id());
                     if (!sensor->step()) {
                         if (sensor->print_err_on_exit) {
                             LOG_ERROR("failed to update entity " << sensor->parent()->id().id()
@@ -1802,6 +1819,7 @@ bool SimControl::run_entities() {
     auto exec_step = [&](auto p, auto step_func) {
         run_callbacks(p);
         try {
+            readjust_origin_to_entity(ents_, p->parent()->id().id());
             if (!step_func(p)) {
                 if (p->print_err_on_exit) {
                     LOG_ERROR("failed to update entity " << p->parent()->id().id()
